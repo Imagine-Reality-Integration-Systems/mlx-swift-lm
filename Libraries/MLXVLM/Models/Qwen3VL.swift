@@ -1314,7 +1314,7 @@ enum Qwen3VLLanguage {
             return norm(hidden)
         }
 
-        private func applyDeepstack(
+        func applyDeepstack(
             hiddenStates: MLXArray,
             visualIndices: MLXArray,
             visualEmbeds: MLXArray
@@ -1669,6 +1669,97 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         _languageModel.wrappedValue = Qwen3VLLanguage.LanguageModel(config)
     }
 
+    public func getHiddenStatesWithImage(
+        inputIds: MLXArray,
+        pixelValues: MLXArray,
+        imageGridTHW: [THW]
+    ) -> MLXArray {
+        print("[DEBUG] getHiddenStatesWithImage - start")
+        fflush(stdout)
+
+        let dtype = visionModel.patchEmbed.proj.weight.dtype
+        let pixels = pixelValues.asType(dtype)
+        
+        // 1. 视觉编码
+        let (visionHidden, deepstackOutputs) = visionModel(pixels, gridTHW: imageGridTHW)
+        print("[DEBUG] visionHidden shape: \(visionHidden.shape)")
+        fflush(stdout)
+        
+        // 2. 文本 embedding
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        
+        // 3. 合并视觉 token 和文本 embedding
+        let mergeSize = config.visionConfiguration.spatialMergeSize
+        let splits = imageGridTHW.map { $0.product / (mergeSize * mergeSize) }
+        let splitIndices = cumulativeSplitIndices(from: splits)
+        let featureSlices = visionHidden.split(indices: splitIndices)
+        let flattenedFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
+        print("[DEBUG] flattenedFeatures shape: \(flattenedFeatures.shape)")
+        fflush(stdout)
+        
+        print("[DEBUG] flattenedFeatures shape: \(flattenedFeatures.shape)")
+        print("[DEBUG] inputIds shape: \(inputIds.shape)")
+
+        let (mergedEmbeds, visualMask) = try! mergeInputIdsWithImageFeatures(
+            imageFeatures: flattenedFeatures,
+            inputEmbeds: textEmbeds,
+            inputIds: inputIds,
+            imageTokenIndex: config.imageTokenIndex,
+            videoTokenIndex: config.videoTokenIndex
+        )
+        print("[DEBUG] mergedEmbeds shape: \(mergedEmbeds.shape)")
+        fflush(stdout)
+        
+        // 4. deepstack embeds
+        var deepstackEmbeds: [MLXArray]? = nil
+        if !deepstackOutputs.isEmpty {
+            deepstackEmbeds = deepstackOutputs.map { layerFeatures in
+                let si = cumulativeSplitIndices(from: splits)
+                let slices = layerFeatures.split(indices: si)
+                return concatenated(slices).asType(textEmbeds.dtype)
+            }
+        }
+        
+        // 5. Transformer 前向，跳过 norm
+        var hidden = mergedEmbeds
+        let T = hidden.shape[1]
+        let mask = MLXArray.tri(T, m: T, k: 0)
+        let causalMask = ((1 - mask) * Float(-1e9)).asType(.bfloat16)
+        
+        for (index, layer) in languageModel.model.layers.enumerated() {
+            hidden = layer(hidden, mask: causalMask, cache: nil, positionIds: nil)
+            
+            if let embeds = deepstackEmbeds, index < embeds.count {
+                // Inline applyDeepstack: upstream's merge helper now returns the
+                // visual-token INDICES ([Int]) instead of a boolean mask array.
+                let indices = visualMask
+                if !indices.isEmpty {
+                    let indexArray = MLXArray(indices.map { UInt32($0) })
+                    hidden[0..., indexArray, 0...] = hidden[0..., indexArray, 0...] + embeds[index]
+                }
+            }
+        }
+
+        return hidden
+    }
+
+    /// Extract hidden states for DreamLite diffusion conditioning
+    public func getHiddenStates(inputIds: MLXArray) -> MLXArray {
+        let m = languageModel.model
+        
+        var hidden = m.embedTokens(inputIds)
+        
+        let seqLen = hidden.shape[1]
+        let mask = MLXArray.tri(seqLen, m: seqLen, k: 0)
+        let causalMask = ((1 - mask) * Float(-1e9)).asType(.bfloat16)  // ← 加这个类型转换
+        
+        for layer in m.layers {
+            hidden = layer(hidden, mask: causalMask, cache: nil, positionIds: nil)
+        }
+        
+        return hidden
+    }
+
     public var vocabularySize: Int { config.vocabSize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
@@ -1676,7 +1767,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel.model.layers
     }
 
-    private func mergeInputIdsWithImageFeatures(
+    func mergeInputIdsWithImageFeatures(
         imageFeatures: MLXArray,
         inputEmbeds: MLXArray,
         inputIds: MLXArray,
@@ -1727,7 +1818,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         return frames
     }
 
-    private func cumulativeSplitIndices(from sizes: [Int]) -> [Int] {
+    func cumulativeSplitIndices(from sizes: [Int]) -> [Int] {
         var sum = 0
         return sizes.dropLast().map { size in
             sum += size
